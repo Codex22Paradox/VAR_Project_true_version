@@ -1,0 +1,59 @@
+body {
+    font-family: "Lexend", sans-serif;
+    background-color: #1b2421
+}
+
+@font-face {
+    font-family: 'Round';
+    src: url('font/extenda-80-peta.otf') format('opentype');
+    font-weight: normal;
+    font-style: normal;
+}
+
+@font-face {
+    font-family: 'Dot';
+    src: url('font/Dot.otf') format('opentype');
+    font-weight: normal;
+    font-style: normal;
+}
+
+@font-face {
+    font-family: 'Optima';
+    src: url('font/Optima.woff') format('opentype');
+    font-weight: normal;
+    font-style: normal;
+}
+
+h1 {
+    font-family: 'Round', sans-serif;
+    font-size: 5.7em;
+    color: #bb2d3b;
+}
+
+h2 {
+    font-family: 'Optima', sans-serif;
+    font-weight: bold;
+}
+
+h3 {
+    font-family: 'Lexend', sans-serif;
+    font-size: 1.3em;
+}
+
+
+.code22 {
+    font-family: 'Dot', sans-serif;
+    font-size: 1.5em;
+    font-weight: bold;
+}
+
+.no-select {
+    user-select: none;
+}
+
+
+.line {
+    opacity: 1;
+}
+
+

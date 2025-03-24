@@ -93,7 +93,7 @@ const handleDeviceDisconnection = async () => {
         if (reconnectTimeout) clearTimeout(reconnectTimeout);
 
         isReconnecting = true; // Imposta lo stato di riconnessione
-        
+
         reconnectTimeout = setTimeout(async () => {
             await waitForDevice();
             console.log('Riavvio della registrazione dopo riconnessione...');
@@ -149,7 +149,9 @@ export const ffmpegModule = {
                         `-segment_time ${SEGMENT_DURATION}`,
                         `-segment_wrap ${SEGMENTS_COUNT}`,
                         '-reset_timestamps 1',
-                        '-avoid_negative_ts make_zero'
+                        '-avoid_negative_ts make_zero',
+                        '-flush_packets 1',  // Force packet flushing
+                        '-fflags +genpts'    // Generate presentation timestamps
                     ])
                     .on('start', (commandLine) => {
                         console.log(`FFmpeg sta registrando in segmenti con dispositivo: ${VIDEO_DEVICE}`);
@@ -220,26 +222,34 @@ export const ffmpegModule = {
         try {
             console.log("Preparazione al salvataggio del buffer video...");
 
-            // Add a longer delay to ensure the most recent segments are written to disk
-            await new Promise(resolve => setTimeout(resolve, 3000));
+            // First, send a signal to ffmpeg to flush its buffers
+            if (ffmpegProcess && ffmpegProcess.kill) {
+                // SIGUSR1 is often used to signal applications to flush buffers
+                try {
+                    process.kill(ffmpegProcess.pid, 'SIGUSR1');
+                } catch (e) {
+                    // Ignore errors, as some platforms may not support this signal
+                }
+            }
+
+            // Increase delay to ensure segments are written
+            await new Promise(resolve => setTimeout(resolve, 5000));
 
             // Manually synchronize all segments from the buffer directory
             const files = await fsPromises.readdir(BUFFER_DIR);
             const allSegments = files.filter(file => file.startsWith('segment') && file.endsWith('.mp4'));
 
-            // Update timing information for all segments
-            const now = Date.now();
+            // Force a file stat update to get the most accurate timestamps
             for (const segment of allSegments) {
-                if (!segmentCreationTimes.has(segment)) {
-                    try {
-                        const stats = await fsPromises.stat(path.join(BUFFER_DIR, segment));
-                        segmentCreationTimes.set(segment, stats.mtime.getTime());
-                    } catch (err) {
-                        segmentCreationTimes.set(segment, now);
-                    }
+                try {
+                    const stats = await fsPromises.stat(path.join(BUFFER_DIR, segment));
+                    segmentCreationTimes.set(segment, stats.mtime.getTime());
+                } catch (err) {
+                    segmentCreationTimes.set(segment, Date.now());
                 }
             }
 
+            // Get updated segments list
             const segments = await getLastMinuteSegments();
             if (segments.length === 0) {
                 if (isReconnecting) {
@@ -451,4 +461,3 @@ process.on('exit', () => {
         process.exit(0);
     });
 });
-

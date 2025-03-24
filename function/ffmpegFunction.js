@@ -17,14 +17,13 @@ const __dirname = path.dirname(__filename);
 const BUFFER_DURATION = 60; // Buffer di 60 secondi
 const SEGMENT_DURATION = 0.5; // Ridotto da 2 a 0.5 secondi per minimizzare il ritardo
 const SEGMENTS_COUNT = Math.ceil(BUFFER_DURATION / SEGMENT_DURATION);
-const isWindows = process.platform === 'win32';
 const RECONNECT_INTERVAL = 5000; // Controlla ogni 5 secondi se il dispositivo è riconnesso
 const MIN_SEGMENTS_REQUIRED = 5; // Minimo numero di segmenti necessari per considerare il buffer pronto
 
-// Imposta il nome del dispositivo dinamicamente
-const VIDEO_DEVICE = process.env.VIDEO_DEVICE || (isWindows ? 'video=NomeDelTuoDispositivo' : '/dev/video0');
+// Imposta il dispositivo di acquisizione Linux
+const VIDEO_DEVICE = process.env.VIDEO_DEVICE || '/dev/video0';
 const OUTPUT_DIR = path.join(__dirname, '../recordings');
-const BUFFER_DIR = isWindows ? 'C:\\temp\\buffer' : '/dev/shm/buffer';
+const BUFFER_DIR = '/dev/shm/buffer';
 const SEGMENT_PATTERN = path.join(BUFFER_DIR, 'segment%03d.mp4');
 
 // Assicurati che le directory necessarie esistano
@@ -41,22 +40,28 @@ let segmentWatcher = null; // Riferimento al watcher per poterlo chiudere
 let isBufferReady = false; // Flag per tracciare se il buffer è pronto
 let lastSegmentSeen = 0; // Traccia l'ultimo segmento visto per monitorare la creazione
 
-// Funzione per verificare se il dispositivo di acquisizione è collegato
+// Funzione migliorata per verificare se il dispositivo di acquisizione è collegato su Linux
 async function isDeviceConnected() {
-    if (isWindows) {
-        // Su Windows, questa è più complessa. Per semplificare, restituiamo true
-        return true;
-    } else {
-        try {
-            // Su Linux verifichiamo se il dispositivo esiste
-            await fsPromises.access(VIDEO_DEVICE, fs.constants.F_OK);
-            // Verifichiamo anche se il dispositivo è funzionante utilizzando v4l2-ctl
-            await execAsync(`v4l2-ctl --device=${VIDEO_DEVICE} --all`);
+    try {
+        // Verifichiamo se il dispositivo esiste
+        await fsPromises.access(VIDEO_DEVICE, fs.constants.F_OK);
+        
+        // Usiamo v4l2-ctl per verificare lo stato del dispositivo
+        const { stdout } = await execAsync(`v4l2-ctl --device=${VIDEO_DEVICE} --all`);
+        
+        // Se otteniamo informazioni dal dispositivo, è collegato
+        if (stdout && stdout.length > 0) {
+            // Verifichiamo anche che il dispositivo non sia in uno stato di errore
+            if (stdout.includes("Input/output error") || stdout.includes("Device or resource busy")) {
+                console.log(`Dispositivo ${VIDEO_DEVICE} in stato di errore`);
+                return false;
+            }
             return true;
-        } catch (err) {
-            console.log(`Dispositivo ${VIDEO_DEVICE} non disponibile: ${err.message}`);
-            return false;
         }
+        return false;
+    } catch (err) {
+        console.log(`Dispositivo ${VIDEO_DEVICE} non disponibile: ${err.message}`);
+        return false;
     }
 }
 
@@ -91,11 +96,10 @@ export const ffmpegModule = {
                 segmentWatcher = null;
             }
 
-            const hwAccel = isWindows ? ['-hwaccel auto'] : [];
             return new Promise((resolve, reject) => {
                 const process = ffmpeg()
                     .input(VIDEO_DEVICE)
-                    .inputFormat(isWindows ? 'dshow' : 'v4l2')
+                    .inputFormat('v4l2')
                     .inputOptions([
                         '-framerate 30',
                         '-video_size 1280x720'
@@ -103,7 +107,7 @@ export const ffmpegModule = {
                     .videoCodec('libx264')
                     .videoBitrate('2500k')
                     .outputOptions([
-                        ...hwAccel,
+                        '-hwaccel vaapi',
                         '-preset ultrafast',
                         '-tune zerolatency',
                         '-profile:v baseline',
@@ -131,16 +135,21 @@ export const ffmpegModule = {
                         } else {
                             console.error('Errore in FFmpeg:', err);
 
-                            // Verifica se l'errore è legato alla disconnessione del dispositivo
+                            // Verifica più accurata per errori di disconnessione su Linux
                             const deviceErrors = [
                                 'No such file or directory',
                                 'Cannot open video device',
                                 'Device or resource busy',
                                 'No such device',
-                                'Input/output error'
+                                'Input/output error',
+                                'Device disconnected',
+                                'Cannot identify device',
+                                'Error reading from device',
+                                'No space left on device',
+                                'Inappropriate ioctl for device'
                             ];
 
-                            if (deviceErrors.some(errText => err.message.includes(errText))) {
+                            if (deviceErrors.some(errText => err.message && err.message.includes(errText))) {
                                 console.log('Dispositivo di acquisizione scollegato. In attesa di riconnessione...');
                                 this.waitForDeviceAndRestart();
                             }
@@ -194,6 +203,10 @@ export const ffmpegModule = {
         // Imposta un intervallo per controllare periodicamente il dispositivo
         reconnectTimer = setInterval(async () => {
             try {
+                // Usiamo il sistema udev di Linux per verificare lo stato corrente del dispositivo
+                const udevCheck = await execAsync('udevadm trigger --action=change --subsystem-match=video4linux')
+                    .catch(() => ({ stdout: '' }));
+                
                 if (await isDeviceConnected()) {
                     console.log('🟢 RICONNESSIONE RILEVATA: Dispositivo ricollegato!');
                     clearInterval(reconnectTimer);

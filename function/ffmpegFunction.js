@@ -66,7 +66,8 @@ export const ffmpegModule = {
         if (!await isDeviceConnected()) {
             console.log('Dispositivo di acquisizione non disponibile. In attesa di riconnessione...');
             this.waitForDeviceAndRestart();
-            throw new Error('Dispositivo di acquisizione non disponibile');
+            // Return instead of throwing an error
+            return { status: 'waiting', message: 'Dispositivo di acquisizione non disponibile. In attesa di riconnessione...' };
         }
 
         try {
@@ -141,9 +142,7 @@ export const ffmpegModule = {
 
     waitForDeviceAndRestart: function () {
         if (waitingForReconnect) return;
-
         waitingForReconnect = true;
-
         // Ferma la registrazione se ancora attiva
         if (isRecording) {
             this.stopRecording();

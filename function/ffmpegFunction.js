@@ -3,7 +3,10 @@ import {fileURLToPath} from 'url';
 import path from 'path';
 import fs from 'fs';
 import fsPromises from 'fs/promises';
+import {exec} from 'child_process';
+import {promisify} from 'util';
 
+const execAsync = promisify(exec);
 const require = createRequire(import.meta.url);
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegStatic = require('ffmpeg-static');
@@ -12,9 +15,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const BUFFER_DURATION = 60; // Buffer di 60 secondi
-const SEGMENT_DURATION = 2; // Ogni segmento dura 2 secondi
+const SEGMENT_DURATION = 0.5; // Ridotto da 2 a 0.5 secondi per minimizzare il ritardo
 const SEGMENTS_COUNT = Math.ceil(BUFFER_DURATION / SEGMENT_DURATION);
 const isWindows = process.platform === 'win32';
+const RECONNECT_INTERVAL = 5000; // Controlla ogni 5 secondi se il dispositivo è riconnesso
 
 // Imposta il nome del dispositivo dinamicamente
 const VIDEO_DEVICE = process.env.VIDEO_DEVICE || (isWindows ? 'video=NomeDelTuoDispositivo' : '/dev/video0');
@@ -29,6 +33,27 @@ ffmpeg.setFfmpegPath(ffmpegStatic);
 let ffmpegProcess = null;
 let isRecording = false;
 let segmentCreationTimes = new Map(); // Traccia quando è stato creato ogni segmento
+let reconnectTimer = null;
+let waitingForReconnect = false;
+
+// Funzione per verificare se il dispositivo di acquisizione è collegato
+async function isDeviceConnected() {
+    if (isWindows) {
+        // Su Windows, questa è più complessa. Per semplificare, restituiamo true
+        return true;
+    } else {
+        try {
+            // Su Linux verifichiamo se il dispositivo esiste
+            await fsPromises.access(VIDEO_DEVICE, fs.constants.F_OK);
+            // Verifichiamo anche se il dispositivo è funzionante utilizzando v4l2-ctl
+            await execAsync(`v4l2-ctl --device=${VIDEO_DEVICE} --all`);
+            return true;
+        } catch (err) {
+            console.log(`Dispositivo ${VIDEO_DEVICE} non disponibile: ${err.message}`);
+            return false;
+        }
+    }
+}
 
 export const ffmpegModule = {
     startRecording: async function () {
@@ -36,6 +61,14 @@ export const ffmpegModule = {
             console.log('La registrazione è già in corso.');
             return;
         }
+
+        // Verifica se il dispositivo è collegato prima di iniziare
+        if (!await isDeviceConnected()) {
+            console.log('Dispositivo di acquisizione non disponibile. In attesa di riconnessione...');
+            this.waitForDeviceAndRestart();
+            throw new Error('Dispositivo di acquisizione non disponibile');
+        }
+
         try {
             await cleanupSegments();
             segmentCreationTimes.clear();
@@ -61,7 +94,9 @@ export const ffmpegModule = {
                         `-segment_time ${SEGMENT_DURATION}`,
                         `-segment_wrap ${SEGMENTS_COUNT}`,
                         '-reset_timestamps 1',
-                        '-avoid_negative_ts make_zero'
+                        '-avoid_negative_ts make_zero',
+                        '-force_key_frames expr:gte(t,n_forced*0.5)', // Forza keyframe ogni 0.5 secondi per un taglio più preciso
+                        '-sc_threshold 0' // Disabilita la rilevazione del cambio di scena per evitare ritardi
                     ])
                     .on('start', (commandLine) => {
                         console.log(`FFmpeg sta registrando in segmenti con dispositivo: ${VIDEO_DEVICE}`);
@@ -75,6 +110,21 @@ export const ffmpegModule = {
                             console.log('FFmpeg process terminated');
                         } else {
                             console.error('Errore in FFmpeg:', err);
+
+                            // Verifica se l'errore è legato alla disconnessione del dispositivo
+                            const deviceErrors = [
+                                'No such file or directory',
+                                'Cannot open video device',
+                                'Device or resource busy',
+                                'No such device',
+                                'Input/output error'
+                            ];
+
+                            if (deviceErrors.some(errText => err.message.includes(errText))) {
+                                console.log('Dispositivo di acquisizione scollegato. In attesa di riconnessione...');
+                                this.waitForDeviceAndRestart();
+                            }
+
                             isRecording = false;
                             ffmpegProcess = null;
                             reject(err);
@@ -87,6 +137,43 @@ export const ffmpegModule = {
             isRecording = false;
             throw err;
         }
+    },
+
+    waitForDeviceAndRestart: function () {
+        if (waitingForReconnect) return;
+
+        waitingForReconnect = true;
+
+        // Ferma la registrazione se ancora attiva
+        if (isRecording) {
+            this.stopRecording();
+        }
+
+        console.log('In attesa che il dispositivo venga ricollegato...');
+
+        // Cancella eventuali timer precedenti
+        if (reconnectTimer) {
+            clearInterval(reconnectTimer);
+        }
+
+        // Imposta un intervallo per controllare periodicamente il dispositivo
+        reconnectTimer = setInterval(async () => {
+            try {
+                if (await isDeviceConnected()) {
+                    console.log('Dispositivo ricollegato! Riavvio della registrazione...');
+                    clearInterval(reconnectTimer);
+                    reconnectTimer = null;
+                    waitingForReconnect = false;
+                    this.startRecording().catch(err => {
+                        console.error('Errore nel riavvio della registrazione:', err);
+                        // Se fallisce, riavvia il processo di attesa
+                        this.waitForDeviceAndRestart();
+                    });
+                }
+            } catch (err) {
+                console.error('Errore durante il controllo del dispositivo:', err);
+            }
+        }, RECONNECT_INTERVAL);
     },
 
     saveLastMinute: async () => {
@@ -103,22 +190,38 @@ export const ffmpegModule = {
             if (segments.length === 0)
                 throw new Error('Nessun segmento disponibile per il salvataggio');
             console.log(`Trovati ${segments.length} segmenti da unire (max 60 secondi)`);
+
+            // Creare il file di lista in modo più efficiente
             const fileContent = segments.map(file =>
                 `file '${path.join(BUFFER_DIR, file).replace(/\\/g, '/')}'`
             ).join('\n');
             await fsPromises.writeFile(listFile, fileContent);
+
             await new Promise((resolve, reject) => {
                 ffmpeg()
                     .input(listFile)
                     .inputOptions(['-f concat', '-safe 0'])
                     .outputOptions([
-                        '-c copy',
-                        '-movflags +faststart'
+                        '-c copy',                // Usa copy per evitare ricodifica (più veloce)
+                        '-movflags +faststart',   // Ottimizzazione per il web
+                        '-fflags +genpts',        // Genera PTS per streaming più fluido
+                        '-flags +global_header'   // Ottimizzazione header
                     ])
-                    .on('end', resolve)
+                    .on('start', () => console.log('Inizio concatenazione segmenti...'))
+                    .on('progress', (progress) => {
+                        // Opzionale: monitoraggio progresso in caso di file più grandi
+                        if (progress && progress.percent) {
+                            console.log(`Progresso concatenazione: ${Math.round(progress.percent)}%`);
+                        }
+                    })
+                    .on('end', () => {
+                        console.log(`Concatenazione completata in ${outputFile}`);
+                        resolve();
+                    })
                     .on('error', reject)
                     .save(outputFile);
             });
+
             console.log(`Salvataggio completato in ${outputFile}!`);
             return outputFile;
         } catch (err) {
@@ -145,6 +248,13 @@ export const ffmpegModule = {
     },
 
     cleanupAndStop: async function () {
+        // Clear any reconnect timers
+        if (reconnectTimer) {
+            clearInterval(reconnectTimer);
+            reconnectTimer = null;
+            waitingForReconnect = false;
+        }
+
         try {
             // Stop the ffmpeg recording if active
             if (ffmpegProcess) {
@@ -168,6 +278,7 @@ export const ffmpegModule = {
         }
     }
 };
+
 const setupSegmentWatcher = () => {
     const watcher = fs.watch(BUFFER_DIR, (eventType, filename) => {
         if (eventType === 'rename' && filename && filename.startsWith('segment') && filename.endsWith('.mp4')) {
@@ -182,41 +293,47 @@ const setupSegmentWatcher = () => {
         ffmpegProcess.on('error', () => watcher.close());
     }
 }
+
 const getLastMinuteSegments = async () => {
     const now = Date.now();
     const cutoffTime = now - (BUFFER_DURATION * 1000);
 
-    // Leggi tutti i segmenti nel buffer
-    const files = await fsPromises.readdir(BUFFER_DIR);
-    const segments = files.filter(file => file.startsWith('segment') && file.endsWith('.mp4'));
+    try {
+        // Leggi tutti i segmenti nel buffer
+        const files = await fsPromises.readdir(BUFFER_DIR);
+        const segments = files.filter(file => file.startsWith('segment') && file.endsWith('.mp4'));
 
-    // Riempi il map per tutti i segmenti che non sono ancora tracciati
-    for (const segment of segments) {
-        if (!segmentCreationTimes.has(segment)) {
-            // Se non abbiamo tracciato questo segmento, usa il tempo di modifica
-            try {
-                const stats = await fsPromises.stat(path.join(BUFFER_DIR, segment));
-                segmentCreationTimes.set(segment, stats.mtime.getTime());
-            } catch (err) {
-                // Se non riusciamo a ottenere le statistiche, usa l'ora corrente
-                segmentCreationTimes.set(segment, now);
-            }
-        }
+        // Ottimizzazione: utilizziamo Promise.all per elaborare tutti i segmenti in parallelo
+        const segmentStats = await Promise.all(
+            segments.map(async segment => {
+                if (!segmentCreationTimes.has(segment)) {
+                    try {
+                        const stats = await fsPromises.stat(path.join(BUFFER_DIR, segment));
+                        segmentCreationTimes.set(segment, stats.mtime.getTime());
+                    } catch (err) {
+                        // In caso di errore, usa l'ora corrente
+                        segmentCreationTimes.set(segment, now);
+                    }
+                }
+                return {
+                    name: segment,
+                    time: segmentCreationTimes.get(segment) || 0,
+                    num: parseInt(segment.match(/segment(\d+)\.mp4/)?.[1] || '0')
+                };
+            })
+        );
+
+        // Filtra e ordina i segmenti per tempo di creazione
+        return segmentStats
+            .filter(segment => segment.time >= cutoffTime)
+            .sort((a, b) => a.num - b.num)
+            .map(segment => segment.name);
+    } catch (err) {
+        console.error('Errore durante la lettura dei segmenti:', err);
+        return [];
     }
-
-    // Filtra e ordina i segmenti per tempo di creazione
-    return segments
-        .filter(segment => {
-            const creationTime = segmentCreationTimes.get(segment) || 0;
-            return creationTime >= cutoffTime;
-        })
-        .sort((a, b) => {
-            // Ordina per numero di segmento in modo numerico
-            const numA = parseInt(a.match(/segment(\d+)\.mp4/)[1]);
-            const numB = parseInt(b.match(/segment(\d+)\.mp4/)[1]);
-            return numA - numB;
-        });
 }
+
 const cleanupSegments = async () => {
     try {
         const files = await fsPromises.readdir(BUFFER_DIR).catch(() => []);

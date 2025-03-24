@@ -30,19 +30,37 @@ app.get('/save-last-minute', async (req, res) => {
         });
     }
 });
+
 app.get('/cleanup-and-stop', async (req, res) => {
     try {
+        // First clean up and stop the recording
         const result = await ffmpegModule.cleanupAndStop();
+
+        // Send success response before shutdown attempt
         res.status(200).json({
-            message: 'Registrazione interrotta e buffer puliti.', result
+            message: 'Registrazione interrotta e buffer puliti. Spegnimento in corso...',
+            result
         });
+
+        // After sending the response, attempt to shut down the computer
+        setTimeout(async () => {
+            try {
+                console.log('Avvio spegnimento del sistema...');
+                await kioskFunction.shutdownComputer();
+            } catch (shutdownErr) {
+                console.error('Errore durante lo spegnimento:', shutdownErr);
+                // Cannot send a response here as it's already been sent
+            }
+        }, 1000); // Small delay to ensure response is sent
+
     } catch (err) {
         console.error('Errore API cleanup-and-stop:', err);
         res.status(500).json({
-            message: 'Errore durante l\'arresto del VAR.', error: err.message
+            message: 'Errore durante l\'arresto del VAR.',
+            error: err.message
         });
     }
-})
+});
 const server = app.listen(port, async () => {
     console.log(`Server in ascolto su http://localhost:${port}`);
     await ffmpegModule.startRecording();

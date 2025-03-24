@@ -1,3 +1,5 @@
+import {exec} from "child_process";
+
 export const kioskFunction = {
     launchBrowserInKioskMode: (port) => {
         const url = `http://localhost:${port}`;

@@ -31,6 +31,7 @@ let segmentCreationTimes = new Map(); // Traccia quando è stato creato ogni seg
 let deviceCheckInterval = null;
 let reconnectTimeout = null;
 let autoReconnect = true; // Flag per controllare se tentare la riconnessione automatica
+let isReconnecting = false; // Flag per indicare che siamo in fase di riconnessione
 
 // Controlla se il dispositivo di acquisizione è collegato
 const isDeviceConnected = () => {
@@ -91,11 +92,17 @@ const handleDeviceDisconnection = async () => {
         console.log('In attesa della riconnessione del dispositivo...');
         if (reconnectTimeout) clearTimeout(reconnectTimeout);
 
+        isReconnecting = true; // Imposta lo stato di riconnessione
+        
         reconnectTimeout = setTimeout(async () => {
             await waitForDevice();
             console.log('Riavvio della registrazione dopo riconnessione...');
             try {
                 await ffmpegModule.startRecording();
+                // Attendiamo che inizino ad accumularsi i segmenti
+                setTimeout(() => {
+                    isReconnecting = false; // Riconnessione completata
+                }, 5000);
             } catch (err) {
                 console.error('Errore durante il riavvio della registrazione:', err);
                 // Riprova dopo un po'
@@ -203,7 +210,7 @@ export const ffmpegModule = {
 
     saveLastMinute: async () => {
         if (!isRecording) {
-            throw new Error('Registrazione non attiva. Avviare prima la registrazione.');
+            console.error('Registrazione non attiva. Avviare prima la registrazione.');
         }
 
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -234,8 +241,14 @@ export const ffmpegModule = {
             }
 
             const segments = await getLastMinuteSegments();
-            if (segments.length === 0)
-                throw new Error('Nessun segmento disponibile per il salvataggio');
+            if (segments.length === 0) {
+                if (isReconnecting) {
+                    console.log('Riconnessione, attendi');
+                    return null; // Ritorna null invece di lanciare un'eccezione
+                } else {
+                    throw new Error('Nessun segmento disponibile per il salvataggio');
+                }
+            }
             console.log(`Trovati ${segments.length} segmenti da unire (max 60 secondi)`);
             const fileContent = segments.map(file =>
                 `file '${path.join(BUFFER_DIR, file).replace(/\\/g, '/')}'`

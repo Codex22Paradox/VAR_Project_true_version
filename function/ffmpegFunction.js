@@ -45,7 +45,7 @@ const waitForDevice = (timeout = 1000) => {
             resolve(true);
             return;
         }
-        
+
         console.log(`In attesa del dispositivo ${VIDEO_DEVICE}...`);
         const checkInterval = setInterval(() => {
             if (isDeviceConnected()) {
@@ -62,7 +62,7 @@ const startDeviceMonitoring = () => {
     if (deviceCheckInterval) {
         clearInterval(deviceCheckInterval);
     }
-    
+
     deviceCheckInterval = setInterval(() => {
         if (isRecording && !isDeviceConnected()) {
             console.log(`Dispositivo ${VIDEO_DEVICE} scollegato durante la registrazione!`);
@@ -74,23 +74,23 @@ const startDeviceMonitoring = () => {
 // Gestisce lo scollegamento del dispositivo
 const handleDeviceDisconnection = async () => {
     console.log('Gestione disconnessione dispositivo...');
-    
+
     // Ferma la registrazione attuale
     if (ffmpegProcess) {
         ffmpegProcess.kill('SIGKILL');
         ffmpegProcess = null;
         isRecording = false;
     }
-    
+
     // Pulisci i buffer
     await cleanupSegments();
     segmentCreationTimes.clear();
-    
+
     // Se l'auto-riconnessione è abilitata, attendi che il dispositivo si riconnetta
     if (autoReconnect) {
         console.log('In attesa della riconnessione del dispositivo...');
         if (reconnectTimeout) clearTimeout(reconnectTimeout);
-        
+
         reconnectTimeout = setTimeout(async () => {
             await waitForDevice();
             console.log('Riavvio della registrazione dopo riconnessione...');
@@ -111,17 +111,17 @@ export const ffmpegModule = {
             console.log('La registrazione è già in corso.');
             return;
         }
-        
+
         try {
             // Controlla se il dispositivo è collegato, altrimenti attendi
             if (!isDeviceConnected()) {
                 console.log(`Dispositivo ${VIDEO_DEVICE} non trovato. In attesa...`);
                 await waitForDevice();
             }
-            
+
             await cleanupSegments();
             segmentCreationTimes.clear();
-            
+
             return new Promise((resolve, reject) => {
                 const process = ffmpeg()
                     .input(VIDEO_DEVICE)
@@ -156,8 +156,8 @@ export const ffmpegModule = {
                         if (err && err.message && err.message.includes('SIGKILL')) {
                             console.log('FFmpeg process terminated');
                         } else if (err && (
-                            err.message.includes('No such file or directory') || 
-                            err.message.includes('Connection refused') || 
+                            err.message.includes('No such file or directory') ||
+                            err.message.includes('Connection refused') ||
                             err.message.includes('Permission denied') ||
                             err.message.includes('Cannot open video device')
                         )) {
@@ -167,7 +167,7 @@ export const ffmpegModule = {
                             console.error('Errore in FFmpeg:', err);
                             isRecording = false;
                             ffmpegProcess = null;
-                            
+
                             // Se c'è un errore non correlato alla disconnessione, riprova dopo un po'
                             if (autoReconnect) {
                                 console.log('Tentativo di riavvio dopo errore...');
@@ -177,7 +177,7 @@ export const ffmpegModule = {
                                     });
                                 }, 2000);
                             }
-                            
+
                             reject(err);
                         }
                     })
@@ -186,7 +186,7 @@ export const ffmpegModule = {
         } catch (err) {
             console.error('Errore durante l\'avvio della registrazione:', err);
             isRecording = false;
-            
+
             // Anche in caso di errore, riprova se autoReconnect è true
             if (autoReconnect) {
                 console.log('Tentativo di riavvio dopo errore...');
@@ -196,7 +196,7 @@ export const ffmpegModule = {
                     });
                 }, 2000);
             }
-            
+
             throw err;
         }
     },
@@ -211,6 +211,28 @@ export const ffmpegModule = {
         const listFile = path.join(BUFFER_DIR, 'filelist.txt');
 
         try {
+            console.log("Preparazione al salvataggio del buffer video...");
+
+            // Add a longer delay to ensure the most recent segments are written to disk
+            await new Promise(resolve => setTimeout(resolve, 3000));
+
+            // Manually synchronize all segments from the buffer directory
+            const files = await fsPromises.readdir(BUFFER_DIR);
+            const allSegments = files.filter(file => file.startsWith('segment') && file.endsWith('.mp4'));
+
+            // Update timing information for all segments
+            const now = Date.now();
+            for (const segment of allSegments) {
+                if (!segmentCreationTimes.has(segment)) {
+                    try {
+                        const stats = await fsPromises.stat(path.join(BUFFER_DIR, segment));
+                        segmentCreationTimes.set(segment, stats.mtime.getTime());
+                    } catch (err) {
+                        segmentCreationTimes.set(segment, now);
+                    }
+                }
+            }
+
             const segments = await getLastMinuteSegments();
             if (segments.length === 0)
                 throw new Error('Nessun segmento disponibile per il salvataggio');
@@ -250,19 +272,19 @@ export const ffmpegModule = {
             ffmpegProcess = null;
             isRecording = false;
             segmentCreationTimes.clear();
-            
+
             // Ferma il monitoraggio del dispositivo
             if (deviceCheckInterval) {
                 clearInterval(deviceCheckInterval);
                 deviceCheckInterval = null;
             }
-            
+
             // Cancella eventuali timeout di riconnessione
             if (reconnectTimeout) {
                 clearTimeout(reconnectTimeout);
                 reconnectTimeout = null;
             }
-            
+
             console.log('Registrazione interrotta.');
         } else {
             console.log('Nessuna registrazione attiva da interrompere.');
@@ -273,7 +295,7 @@ export const ffmpegModule = {
         try {
             // Disabilita temporaneamente la riconnessione automatica
             autoReconnect = false;
-            
+
             // Stop the ffmpeg recording if active
             if (ffmpegProcess) {
                 ffmpegProcess.kill('SIGKILL');
@@ -283,43 +305,43 @@ export const ffmpegModule = {
             } else {
                 console.log('Nessuna registrazione attiva da interrompere.');
             }
-            
+
             // Ferma il monitoraggio del dispositivo
             if (deviceCheckInterval) {
                 clearInterval(deviceCheckInterval);
                 deviceCheckInterval = null;
             }
-            
+
             // Cancella eventuali timeout di riconnessione
             if (reconnectTimeout) {
                 clearTimeout(reconnectTimeout);
                 reconnectTimeout = null;
             }
-            
+
             // Clear segment tracking
             segmentCreationTimes.clear();
 
             // Clean up segment files
             await cleanupSegments();
-            
+
             // Riabilita la riconnessione automatica per usi futuri
             autoReconnect = true;
 
             return {success: true, message: 'Registrazione interrotta e buffer puliti.'};
         } catch (err) {
             console.error('Errore durante la pulizia e l\'arresto:', err);
-            
+
             // Riabilita la riconnessione automatica anche in caso di errore
             autoReconnect = true;
             throw err;
         }
     },
-    
+
     // Metodo per verificare manualmente lo stato del dispositivo
     isDeviceConnected: () => {
         return isDeviceConnected();
     },
-    
+
     // Metodo per disabilitare/abilitare la riconnessione automatica
     setAutoReconnect: (enable) => {
         autoReconnect = Boolean(enable);

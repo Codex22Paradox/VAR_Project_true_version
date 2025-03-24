@@ -3,10 +3,7 @@ import {fileURLToPath} from 'url';
 import path from 'path';
 import fs from 'fs';
 import fsPromises from 'fs/promises';
-import {exec} from 'child_process';
-import {promisify} from 'util';
 
-const execAsync = promisify(exec);
 const require = createRequire(import.meta.url);
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegStatic = require('ffmpeg-static');
@@ -15,12 +12,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const BUFFER_DURATION = 60; // Buffer di 60 secondi
-const SEGMENT_DURATION = 0.5; // Ridotto da 2 a 0.5 secondi per minimizzare il ritardo
+const SEGMENT_DURATION = 0.5; // Ogni segmento dura 0.5 secondi
 const SEGMENTS_COUNT = Math.ceil(BUFFER_DURATION / SEGMENT_DURATION);
-const RECONNECT_INTERVAL = 5000; // Controlla ogni 5 secondi se il dispositivo è riconnesso
-const MIN_SEGMENTS_REQUIRED = 5; // Minimo numero di segmenti necessari per considerare il buffer pronto
 
-// Imposta il dispositivo di acquisizione Linux
+// Configurazione specifica per Lubuntu
 const VIDEO_DEVICE = process.env.VIDEO_DEVICE || '/dev/video0';
 const OUTPUT_DIR = path.join(__dirname, '../recordings');
 const BUFFER_DIR = '/dev/shm/buffer';
@@ -33,37 +28,82 @@ ffmpeg.setFfmpegPath(ffmpegStatic);
 let ffmpegProcess = null;
 let isRecording = false;
 let segmentCreationTimes = new Map(); // Traccia quando è stato creato ogni segmento
-let reconnectTimer = null;
-let waitingForReconnect = false;
-let recordingStartTime = null; // Traccia quando è iniziata la registrazione
-let segmentWatcher = null; // Riferimento al watcher per poterlo chiudere
-let isBufferReady = false; // Flag per tracciare se il buffer è pronto
-let lastSegmentSeen = 0; // Traccia l'ultimo segmento visto per monitorare la creazione
+let deviceCheckInterval = null;
+let reconnectTimeout = null;
+let autoReconnect = true; // Flag per controllare se tentare la riconnessione automatica
 
-// Funzione migliorata per verificare se il dispositivo di acquisizione è collegato su Linux
-async function isDeviceConnected() {
-    try {
-        // Verifichiamo se il dispositivo esiste
-        await fsPromises.access(VIDEO_DEVICE, fs.constants.F_OK);
-        
-        // Usiamo v4l2-ctl per verificare lo stato del dispositivo
-        const { stdout } = await execAsync(`v4l2-ctl --device=${VIDEO_DEVICE} --all`);
-        
-        // Se otteniamo informazioni dal dispositivo, è collegato
-        if (stdout && stdout.length > 0) {
-            // Verifichiamo anche che il dispositivo non sia in uno stato di errore
-            if (stdout.includes("Input/output error") || stdout.includes("Device or resource busy")) {
-                console.log(`Dispositivo ${VIDEO_DEVICE} in stato di errore`);
-                return false;
-            }
-            return true;
+// Controlla se il dispositivo di acquisizione è collegato
+const isDeviceConnected = () => {
+    return fs.existsSync(VIDEO_DEVICE);
+};
+
+// Attende che il dispositivo sia collegato
+const waitForDevice = (timeout = 1000) => {
+    return new Promise(resolve => {
+        if (isDeviceConnected()) {
+            console.log(`Dispositivo ${VIDEO_DEVICE} trovato!`);
+            resolve(true);
+            return;
         }
-        return false;
-    } catch (err) {
-        console.log(`Dispositivo ${VIDEO_DEVICE} non disponibile: ${err.message}`);
-        return false;
+        
+        console.log(`In attesa del dispositivo ${VIDEO_DEVICE}...`);
+        const checkInterval = setInterval(() => {
+            if (isDeviceConnected()) {
+                clearInterval(checkInterval);
+                console.log(`Dispositivo ${VIDEO_DEVICE} collegato!`);
+                resolve(true);
+            }
+        }, timeout);
+    });
+};
+
+// Monitora lo stato del dispositivo durante la registrazione
+const startDeviceMonitoring = () => {
+    if (deviceCheckInterval) {
+        clearInterval(deviceCheckInterval);
     }
-}
+    
+    deviceCheckInterval = setInterval(() => {
+        if (isRecording && !isDeviceConnected()) {
+            console.log(`Dispositivo ${VIDEO_DEVICE} scollegato durante la registrazione!`);
+            handleDeviceDisconnection();
+        }
+    }, 1000); // Controlla ogni secondo
+};
+
+// Gestisce lo scollegamento del dispositivo
+const handleDeviceDisconnection = async () => {
+    console.log('Gestione disconnessione dispositivo...');
+    
+    // Ferma la registrazione attuale
+    if (ffmpegProcess) {
+        ffmpegProcess.kill('SIGKILL');
+        ffmpegProcess = null;
+        isRecording = false;
+    }
+    
+    // Pulisci i buffer
+    await cleanupSegments();
+    segmentCreationTimes.clear();
+    
+    // Se l'auto-riconnessione è abilitata, attendi che il dispositivo si riconnetta
+    if (autoReconnect) {
+        console.log('In attesa della riconnessione del dispositivo...');
+        if (reconnectTimeout) clearTimeout(reconnectTimeout);
+        
+        reconnectTimeout = setTimeout(async () => {
+            await waitForDevice();
+            console.log('Riavvio della registrazione dopo riconnessione...');
+            try {
+                await ffmpegModule.startRecording();
+            } catch (err) {
+                console.error('Errore durante il riavvio della registrazione:', err);
+                // Riprova dopo un po'
+                reconnectTimeout = setTimeout(() => handleDeviceDisconnection(), 2000);
+            }
+        }, 1000);
+    }
+};
 
 export const ffmpegModule = {
     startRecording: async function () {
@@ -71,31 +111,17 @@ export const ffmpegModule = {
             console.log('La registrazione è già in corso.');
             return;
         }
-
-        // Verifica se il dispositivo è collegato prima di iniziare
-        if (!await isDeviceConnected()) {
-            console.log('Dispositivo di acquisizione non disponibile. In attesa di riconnessione...');
-            this.waitForDeviceAndRestart();
-            return {
-                status: 'waiting',
-                message: 'Dispositivo di acquisizione non disponibile. In attesa di riconnessione...'
-            };
-        }
-
+        
         try {
-            // Reset completo dello stato
+            // Controlla se il dispositivo è collegato, altrimenti attendi
+            if (!isDeviceConnected()) {
+                console.log(`Dispositivo ${VIDEO_DEVICE} non trovato. In attesa...`);
+                await waitForDevice();
+            }
+            
             await cleanupSegments();
             segmentCreationTimes.clear();
-            isBufferReady = false;
-            lastSegmentSeen = 0;
-            recordingStartTime = Date.now();
-
-            // Chiudiamo eventuali watcher precedenti
-            if (segmentWatcher) {
-                segmentWatcher.close();
-                segmentWatcher = null;
-            }
-
+            
             return new Promise((resolve, reject) => {
                 const process = ffmpeg()
                     .input(VIDEO_DEVICE)
@@ -107,7 +133,6 @@ export const ffmpegModule = {
                     .videoCodec('libx264')
                     .videoBitrate('2500k')
                     .outputOptions([
-                        '-hwaccel vaapi',
                         '-preset ultrafast',
                         '-tune zerolatency',
                         '-profile:v baseline',
@@ -117,46 +142,42 @@ export const ffmpegModule = {
                         `-segment_time ${SEGMENT_DURATION}`,
                         `-segment_wrap ${SEGMENTS_COUNT}`,
                         '-reset_timestamps 1',
-                        '-avoid_negative_ts make_zero',
-                        '-force_key_frames expr:gte(t,n_forced*0.5)', // Forza keyframe ogni 0.5 secondi
-                        '-sc_threshold 0' // Disabilita la rilevazione del cambio di scena
+                        '-avoid_negative_ts make_zero'
                     ])
                     .on('start', (commandLine) => {
                         console.log(`FFmpeg sta registrando in segmenti con dispositivo: ${VIDEO_DEVICE}`);
                         ffmpegProcess = process;
                         isRecording = true;
                         setupSegmentWatcher();
-                        console.log("Registrazione avviata con successo, buffer in preparazione...");
+                        startDeviceMonitoring(); // Avvia il monitoraggio del dispositivo
                         resolve();
                     })
                     .on('error', (err) => {
                         if (err && err.message && err.message.includes('SIGKILL')) {
                             console.log('FFmpeg process terminated');
+                        } else if (err && (
+                            err.message.includes('No such file or directory') || 
+                            err.message.includes('Connection refused') || 
+                            err.message.includes('Permission denied') ||
+                            err.message.includes('Cannot open video device')
+                        )) {
+                            console.log('Errore di accesso al dispositivo:', err.message);
+                            handleDeviceDisconnection();
                         } else {
                             console.error('Errore in FFmpeg:', err);
-
-                            // Verifica più accurata per errori di disconnessione su Linux
-                            const deviceErrors = [
-                                'No such file or directory',
-                                'Cannot open video device',
-                                'Device or resource busy',
-                                'No such device',
-                                'Input/output error',
-                                'Device disconnected',
-                                'Cannot identify device',
-                                'Error reading from device',
-                                'No space left on device',
-                                'Inappropriate ioctl for device'
-                            ];
-
-                            if (deviceErrors.some(errText => err.message && err.message.includes(errText))) {
-                                console.log('Dispositivo di acquisizione scollegato. In attesa di riconnessione...');
-                                this.waitForDeviceAndRestart();
-                            }
-
                             isRecording = false;
                             ffmpegProcess = null;
-                            isBufferReady = false;
+                            
+                            // Se c'è un errore non correlato alla disconnessione, riprova dopo un po'
+                            if (autoReconnect) {
+                                console.log('Tentativo di riavvio dopo errore...');
+                                setTimeout(() => {
+                                    this.startRecording().catch(e => {
+                                        console.error('Errore durante il riavvio:', e);
+                                    });
+                                }, 2000);
+                            }
+                            
                             reject(err);
                         }
                     })
@@ -165,116 +186,24 @@ export const ffmpegModule = {
         } catch (err) {
             console.error('Errore durante l\'avvio della registrazione:', err);
             isRecording = false;
-            isBufferReady = false;
+            
+            // Anche in caso di errore, riprova se autoReconnect è true
+            if (autoReconnect) {
+                console.log('Tentativo di riavvio dopo errore...');
+                setTimeout(() => {
+                    this.startRecording().catch(e => {
+                        console.error('Errore durante il riavvio:', e);
+                    });
+                }, 2000);
+            }
+            
             throw err;
         }
-    },
-
-    waitForDeviceAndRestart: function () {
-        if (waitingForReconnect) return;
-        waitingForReconnect = true;
-
-        console.log('🔴 DISCONNESSIONE RILEVATA: Dispositivo di acquisizione scollegato');
-
-        // Ferma la registrazione se ancora attiva
-        if (isRecording) {
-            this.stopRecording();
-        }
-
-        // Cancella eventuali timer precedenti
-        if (reconnectTimer) {
-            clearInterval(reconnectTimer);
-        }
-
-        // Reset completo dello stato
-        isBufferReady = false;
-        segmentCreationTimes.clear();
-        lastSegmentSeen = 0;
-
-        // Pulisci immediatamente i segmenti vecchi
-        cleanupSegments().catch(err => console.error('Errore nella pulizia dei segmenti:', err));
-
-        // Chiudi il watcher se presente
-        if (segmentWatcher) {
-            segmentWatcher.close();
-            segmentWatcher = null;
-        }
-
-        // Imposta un intervallo per controllare periodicamente il dispositivo
-        reconnectTimer = setInterval(async () => {
-            try {
-                // Usiamo il sistema udev di Linux per verificare lo stato corrente del dispositivo
-                const udevCheck = await execAsync('udevadm trigger --action=change --subsystem-match=video4linux')
-                    .catch(() => ({ stdout: '' }));
-                
-                if (await isDeviceConnected()) {
-                    console.log('🟢 RICONNESSIONE RILEVATA: Dispositivo ricollegato!');
-                    clearInterval(reconnectTimer);
-                    reconnectTimer = null;
-                    waitingForReconnect = false;
-
-                    // Reset completo dello stato e pulizia aggressiva prima di riavviare
-                    await cleanupSegments();
-                    segmentCreationTimes.clear();
-                    recordingStartTime = null;
-                    isBufferReady = false;
-                    lastSegmentSeen = 0;
-
-                    // Breve pausa per assicurarsi che il dispositivo sia stabile
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-
-                    this.startRecording().catch(err => {
-                        console.error('Errore nel riavvio della registrazione:', err);
-                        this.waitForDeviceAndRestart();
-                    });
-                }
-            } catch (err) {
-                console.error('Errore durante il controllo del dispositivo:', err);
-            }
-        }, RECONNECT_INTERVAL);
     },
 
     saveLastMinute: async () => {
         if (!isRecording) {
             throw new Error('Registrazione non attiva. Avviare prima la registrazione.');
-        }
-
-        // Verifica che la registrazione sia attiva da abbastanza tempo
-        const recordingDuration = Date.now() - (recordingStartTime || 0);
-        const minRecordingTime = 5000; // 5 secondi minimi
-
-        if (recordingDuration < minRecordingTime) {
-            console.log(`Registrazione attiva da soli ${Math.round(recordingDuration / 1000)} secondi, attendere...`);
-            return {
-                status: 'waiting',
-                message: 'Registrazione appena avviata. Attendere qualche secondo.'
-            };
-        }
-
-        // Verifica lo stato del buffer
-        if (!isBufferReady) {
-            // Ottieni lo stato attuale del buffer per reporting
-            const files = await fsPromises.readdir(BUFFER_DIR);
-            const allSegments = files.filter(file => file.startsWith('segment') && file.endsWith('.mp4'));
-
-            console.log(`Stato attuale: ${allSegments.length}/${MIN_SEGMENTS_REQUIRED} segmenti disponibili`);
-
-            // Pulisci i segmenti vecchi se ci sono troppi segmenti ma il buffer non è pronto
-            // (potrebbe significare che sono rimasti segmenti vecchi dopo una riconnessione)
-            if (allSegments.length > MIN_SEGMENTS_REQUIRED * 2) {
-                console.log('Troppi segmenti ma buffer non pronto. Pulizia segmenti vecchi...');
-                await cleanupSegments();
-                isBufferReady = false;
-                return {
-                    status: 'reset',
-                    message: 'Stato incoerente rilevato. Buffer resettato, riprovare tra poco.'
-                };
-            }
-
-            return {
-                status: 'waiting',
-                message: `Buffer in preparazione (${allSegments.length}/${MIN_SEGMENTS_REQUIRED}). Attendere qualche secondo.`
-            };
         }
 
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -283,50 +212,25 @@ export const ffmpegModule = {
 
         try {
             const segments = await getLastMinuteSegments();
-            if (segments.length === 0) {
-                console.log('Nessun segmento disponibile per il salvataggio dopo la riconnessione.');
-
-                // Reset dello stato del buffer per forzare una nuova inizializzazione
-                isBufferReady = false;
-
-                return {
-                    status: 'waiting',
-                    message: 'Buffer in reinizializzazione dopo riconnessione. Riprovare tra qualche secondo.'
-                };
-            }
-
+            if (segments.length === 0)
+                throw new Error('Nessun segmento disponibile per il salvataggio');
             console.log(`Trovati ${segments.length} segmenti da unire (max 60 secondi)`);
-
-            // Creare il file di lista
             const fileContent = segments.map(file =>
                 `file '${path.join(BUFFER_DIR, file).replace(/\\/g, '/')}'`
             ).join('\n');
             await fsPromises.writeFile(listFile, fileContent);
-
             await new Promise((resolve, reject) => {
                 ffmpeg()
                     .input(listFile)
                     .inputOptions(['-f concat', '-safe 0'])
                     .outputOptions([
                         '-c copy',
-                        '-movflags +faststart',
-                        '-fflags +genpts',
-                        '-flags +global_header'
+                        '-movflags +faststart'
                     ])
-                    .on('start', () => console.log('Inizio concatenazione segmenti...'))
-                    .on('progress', (progress) => {
-                        if (progress && progress.percent) {
-                            console.log(`Progresso concatenazione: ${Math.round(progress.percent)}%`);
-                        }
-                    })
-                    .on('end', () => {
-                        console.log(`Concatenazione completata in ${outputFile}`);
-                        resolve();
-                    })
+                    .on('end', resolve)
                     .on('error', reject)
                     .save(outputFile);
             });
-
             console.log(`Salvataggio completato in ${outputFile}!`);
             return outputFile;
         } catch (err) {
@@ -345,15 +249,20 @@ export const ffmpegModule = {
             ffmpegProcess.kill('SIGKILL');
             ffmpegProcess = null;
             isRecording = false;
-            recordingStartTime = null;
-            isBufferReady = false;
             segmentCreationTimes.clear();
-
-            if (segmentWatcher) {
-                segmentWatcher.close();
-                segmentWatcher = null;
+            
+            // Ferma il monitoraggio del dispositivo
+            if (deviceCheckInterval) {
+                clearInterval(deviceCheckInterval);
+                deviceCheckInterval = null;
             }
-
+            
+            // Cancella eventuali timeout di riconnessione
+            if (reconnectTimeout) {
+                clearTimeout(reconnectTimeout);
+                reconnectTimeout = null;
+            }
+            
             console.log('Registrazione interrotta.');
         } else {
             console.log('Nessuna registrazione attiva da interrompere.');
@@ -361,160 +270,121 @@ export const ffmpegModule = {
     },
 
     cleanupAndStop: async function () {
-        // Clear any reconnect timers
-        if (reconnectTimer) {
-            clearInterval(reconnectTimer);
-            reconnectTimer = null;
-            waitingForReconnect = false;
-        }
-
         try {
+            // Disabilita temporaneamente la riconnessione automatica
+            autoReconnect = false;
+            
             // Stop the ffmpeg recording if active
             if (ffmpegProcess) {
                 ffmpegProcess.kill('SIGKILL');
                 ffmpegProcess = null;
                 isRecording = false;
-                recordingStartTime = null;
-                isBufferReady = false;
                 console.log('Registrazione interrotta.');
             } else {
                 console.log('Nessuna registrazione attiva da interrompere.');
             }
-
-            // Chiudi il watcher dei segmenti
-            if (segmentWatcher) {
-                segmentWatcher.close();
-                segmentWatcher = null;
+            
+            // Ferma il monitoraggio del dispositivo
+            if (deviceCheckInterval) {
+                clearInterval(deviceCheckInterval);
+                deviceCheckInterval = null;
             }
-
+            
+            // Cancella eventuali timeout di riconnessione
+            if (reconnectTimeout) {
+                clearTimeout(reconnectTimeout);
+                reconnectTimeout = null;
+            }
+            
             // Clear segment tracking
             segmentCreationTimes.clear();
 
             // Clean up segment files
             await cleanupSegments();
+            
+            // Riabilita la riconnessione automatica per usi futuri
+            autoReconnect = true;
 
             return {success: true, message: 'Registrazione interrotta e buffer puliti.'};
         } catch (err) {
             console.error('Errore durante la pulizia e l\'arresto:', err);
+            
+            // Riabilita la riconnessione automatica anche in caso di errore
+            autoReconnect = true;
             throw err;
         }
+    },
+    
+    // Metodo per verificare manualmente lo stato del dispositivo
+    isDeviceConnected: () => {
+        return isDeviceConnected();
+    },
+    
+    // Metodo per disabilitare/abilitare la riconnessione automatica
+    setAutoReconnect: (enable) => {
+        autoReconnect = Boolean(enable);
+        return autoReconnect;
     }
 };
 
 const setupSegmentWatcher = () => {
-    // Chiudi eventuali watcher precedenti
-    if (segmentWatcher) {
-        segmentWatcher.close();
-    }
-
-    segmentWatcher = fs.watch(BUFFER_DIR, async (eventType, filename) => {
+    const watcher = fs.watch(BUFFER_DIR, (eventType, filename) => {
         if (eventType === 'rename' && filename && filename.startsWith('segment') && filename.endsWith('.mp4')) {
             // Quando un nuovo file viene creato, tieni traccia dell'ora
-            const currentTime = Date.now();
-            segmentCreationTimes.set(filename, currentTime);
-
-            // Cerca di estrarre il numero del segmento per monitoraggio
-            const match = filename.match(/segment(\d+)\.mp4/);
-            if (match) {
-                const segNum = parseInt(match[1]);
-                lastSegmentSeen = Math.max(lastSegmentSeen, segNum);
-            }
-
-            // Verifica se il buffer è pronto basandosi sul numero di segmenti
-            if (!isBufferReady) {
-                const segments = await getLastMinuteSegments();
-                if (segments.length >= MIN_SEGMENTS_REQUIRED) {
-                    isBufferReady = true;
-                    console.log(`Buffer pronto! ${segments.length} segmenti disponibili.`);
-                }
-
-                // Log dettagliato durante l'inizializzazione
-                if (segmentCreationTimes.size % 3 === 0 || segmentCreationTimes.size === MIN_SEGMENTS_REQUIRED) {
-                    console.log(`Preparazione buffer: ${segmentCreationTimes.size}/${MIN_SEGMENTS_REQUIRED} segmenti creati.`);
-                }
-            }
+            segmentCreationTimes.set(filename, Date.now());
         }
     });
 
     // Se si ferma la registrazione, ferma anche il watcher
     if (ffmpegProcess) {
-        ffmpegProcess.on('end', () => {
-            if (segmentWatcher) segmentWatcher.close();
-            segmentWatcher = null;
-        });
-        ffmpegProcess.on('error', () => {
-            if (segmentWatcher) segmentWatcher.close();
-            segmentWatcher = null;
-        });
+        ffmpegProcess.on('end', () => watcher.close());
+        ffmpegProcess.on('error', () => watcher.close());
     }
 }
-
 const getLastMinuteSegments = async () => {
     const now = Date.now();
     const cutoffTime = now - (BUFFER_DURATION * 1000);
 
-    try {
-        // Leggi tutti i segmenti nel buffer
-        const files = await fsPromises.readdir(BUFFER_DIR);
-        const segments = files.filter(file => file.startsWith('segment') && file.endsWith('.mp4'));
+    // Leggi tutti i segmenti nel buffer
+    const files = await fsPromises.readdir(BUFFER_DIR);
+    const segments = files.filter(file => file.startsWith('segment') && file.endsWith('.mp4'));
 
-        if (segments.length === 0) {
-            console.log("Nessun segmento trovato nel buffer");
-            return [];
-        }
-
-        // Ottimizzazione: utilizziamo Promise.all per elaborare tutti i segmenti in parallelo
-        const segmentStats = await Promise.all(
-            segments.map(async segment => {
-                if (!segmentCreationTimes.has(segment)) {
-                    try {
-                        const stats = await fsPromises.stat(path.join(BUFFER_DIR, segment));
-                        segmentCreationTimes.set(segment, stats.mtime.getTime());
-                    } catch (err) {
-                        // In caso di errore, usa l'ora corrente
-                        segmentCreationTimes.set(segment, now);
-                    }
-                }
-                return {
-                    name: segment,
-                    time: segmentCreationTimes.get(segment) || 0,
-                    num: parseInt(segment.match(/segment(\d+)\.mp4/)?.[1] || '0')
-                };
-            })
-        );
-
-        // Filtra e ordina i segmenti per tempo di creazione
-        const validSegments = segmentStats
-            .filter(segment => segment.time >= cutoffTime)
-            .sort((a, b) => a.num - b.num)
-            .map(segment => segment.name);
-
-        console.log(`Trovati ${validSegments.length} segmenti validi su ${segments.length} totali`);
-        return validSegments;
-    } catch (err) {
-        console.error('Errore durante la lettura dei segmenti:', err);
-        return [];
-    }
-}
-
-const cleanupSegments = async () => {
-    try {
-        console.log('Pulizia dei segmenti nel buffer...');
-        const files = await fsPromises.readdir(BUFFER_DIR).catch(() => []);
-        let deletedCount = 0;
-
-        for (const file of files) {
-            if (file.startsWith('segment') && file.endsWith('.mp4')) {
-                try {
-                    await fsPromises.unlink(path.join(BUFFER_DIR, file));
-                    deletedCount++;
-                } catch (err) {
-                    console.error(`Errore eliminando ${file}:`, err.message);
-                }
+    // Riempi il map per tutti i segmenti che non sono ancora tracciati
+    for (const segment of segments) {
+        if (!segmentCreationTimes.has(segment)) {
+            // Se non abbiamo tracciato questo segmento, usa il tempo di modifica
+            try {
+                const stats = await fsPromises.stat(path.join(BUFFER_DIR, segment));
+                segmentCreationTimes.set(segment, stats.mtime.getTime());
+            } catch (err) {
+                // Se non riusciamo a ottenere le statistiche, usa l'ora corrente
+                segmentCreationTimes.set(segment, now);
             }
         }
+    }
 
-        console.log(`Pulizia completata: ${deletedCount} segmenti rimossi.`);
+    // Filtra e ordina i segmenti per tempo di creazione
+    return segments
+        .filter(segment => {
+            const creationTime = segmentCreationTimes.get(segment) || 0;
+            return creationTime >= cutoffTime;
+        })
+        .sort((a, b) => {
+            // Ordina per numero di segmento in modo numerico
+            const numA = parseInt(a.match(/segment(\d+)\.mp4/)[1]);
+            const numB = parseInt(b.match(/segment(\d+)\.mp4/)[1]);
+            return numA - numB;
+        });
+}
+const cleanupSegments = async () => {
+    try {
+        const files = await fsPromises.readdir(BUFFER_DIR).catch(() => []);
+        for (const file of files) {
+            if (file.startsWith('segment') && file.endsWith('.mp4')) {
+                await fsPromises.unlink(path.join(BUFFER_DIR, file)).catch(() => {
+                });
+            }
+        }
     } catch (err) {
         console.error('Errore durante la pulizia dei segmenti:', err);
     }
@@ -524,8 +394,11 @@ process.on('exit', () => {
     if (ffmpegProcess) {
         ffmpegProcess.kill('SIGKILL');
     }
-    if (segmentWatcher) {
-        segmentWatcher.close();
+    if (deviceCheckInterval) {
+        clearInterval(deviceCheckInterval);
+    }
+    if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
     }
 });
 
@@ -534,9 +407,13 @@ process.on('exit', () => {
         if (ffmpegProcess) {
             ffmpegProcess.kill('SIGKILL');
         }
-        if (segmentWatcher) {
-            segmentWatcher.close();
+        if (deviceCheckInterval) {
+            clearInterval(deviceCheckInterval);
+        }
+        if (reconnectTimeout) {
+            clearTimeout(reconnectTimeout);
         }
         process.exit(0);
     });
 });
+

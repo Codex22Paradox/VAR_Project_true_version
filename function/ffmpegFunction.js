@@ -165,38 +165,50 @@ export const ffmpegModule = {
         if (waitingForReconnect) return;
         waitingForReconnect = true;
 
+        console.log('🔴 DISCONNESSIONE RILEVATA: Dispositivo di acquisizione scollegato');
+
         // Ferma la registrazione se ancora attiva
         if (isRecording) {
             this.stopRecording();
         }
-
-        console.log('In attesa che il dispositivo venga ricollegato...');
 
         // Cancella eventuali timer precedenti
         if (reconnectTimer) {
             clearInterval(reconnectTimer);
         }
 
+        // Reset completo dello stato
+        isBufferReady = false;
+        segmentCreationTimes.clear();
+        lastSegmentSeen = 0;
+
+        // Pulisci immediatamente i segmenti vecchi
+        cleanupSegments().catch(err => console.error('Errore nella pulizia dei segmenti:', err));
+
+        // Chiudi il watcher se presente
+        if (segmentWatcher) {
+            segmentWatcher.close();
+            segmentWatcher = null;
+        }
+
         // Imposta un intervallo per controllare periodicamente il dispositivo
         reconnectTimer = setInterval(async () => {
             try {
                 if (await isDeviceConnected()) {
-                    console.log('Dispositivo ricollegato! Riavvio della registrazione...');
+                    console.log('🟢 RICONNESSIONE RILEVATA: Dispositivo ricollegato!');
                     clearInterval(reconnectTimer);
                     reconnectTimer = null;
                     waitingForReconnect = false;
 
-                    // Reset completo dello stato prima di riavviare
+                    // Reset completo dello stato e pulizia aggressiva prima di riavviare
                     await cleanupSegments();
                     segmentCreationTimes.clear();
                     recordingStartTime = null;
                     isBufferReady = false;
                     lastSegmentSeen = 0;
 
-                    if (segmentWatcher) {
-                        segmentWatcher.close();
-                        segmentWatcher = null;
-                    }
+                    // Breve pausa per assicurarsi che il dispositivo sia stabile
+                    await new Promise(resolve => setTimeout(resolve, 1000));
 
                     this.startRecording().catch(err => {
                         console.error('Errore nel riavvio della registrazione:', err);
@@ -226,15 +238,25 @@ export const ffmpegModule = {
             };
         }
 
-        // Verifica se il buffer è pronto
+        // Verifica lo stato del buffer
         if (!isBufferReady) {
-            console.log("Buffer non ancora pronto. Attendere il riempimento iniziale.");
-
             // Ottieni lo stato attuale del buffer per reporting
             const files = await fsPromises.readdir(BUFFER_DIR);
             const allSegments = files.filter(file => file.startsWith('segment') && file.endsWith('.mp4'));
 
             console.log(`Stato attuale: ${allSegments.length}/${MIN_SEGMENTS_REQUIRED} segmenti disponibili`);
+
+            // Pulisci i segmenti vecchi se ci sono troppi segmenti ma il buffer non è pronto
+            // (potrebbe significare che sono rimasti segmenti vecchi dopo una riconnessione)
+            if (allSegments.length > MIN_SEGMENTS_REQUIRED * 2) {
+                console.log('Troppi segmenti ma buffer non pronto. Pulizia segmenti vecchi...');
+                await cleanupSegments();
+                isBufferReady = false;
+                return {
+                    status: 'reset',
+                    message: 'Stato incoerente rilevato. Buffer resettato, riprovare tra poco.'
+                };
+            }
 
             return {
                 status: 'waiting',
